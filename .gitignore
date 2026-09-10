@@ -36,6 +36,7 @@ output_json/
 *.egg-info/
 dist/
 build/
+test_data/
 
 # PaddleOCR cache
 __paddle__/

@@ -1,10 +1,13 @@
 import re
 import numpy as np
 from thefuzz import process, fuzz
+from wilayah_lookup import WilayahLookup
 
 
 class KTPExtractor:
     def __init__(self):
+        self.wilayah = WilayahLookup()
+
         self.canonical_fields = [
             "PROVINSI", "KABUPATEN", "NIK", "Nama", "Tempat/Tgl Lahir",
             "Jenis Kelamin", "Gol. Darah", "Alamat", "RT/RW", "Kel/Desa",
@@ -16,15 +19,18 @@ class KTPExtractor:
             "RTIRW": "RT/RW",
             "RTRW": "RT/RW",
             "RT.RW": "RT/RW",
+            "RIRW": "RT/RW",
             "NIS KELAMIN": "Jenis Kelamin",
             "ENIS KELAMIN": "Jenis Kelamin",
             "EMPAT/TGL": "Tempat/Tgl Lahir",
             "MPAT/TGL": "Tempat/Tgl Lahir",
             "GAMA": "Agama",
             "KERJAAN": "Pekerjaan",
+            "PEKARJAON": "Pekerjaan",
             "ATUS PERKAWINAN": "Status Perkawinan",
             "KAL/DESA": "Kel/Desa",
             "KEL/DESA": "Kel/Desa",
+            "KACAMUTAN": "Kecamatan",
             "NO KTP": "NIK"
         }
 
@@ -41,7 +47,21 @@ class KTPExtractor:
                 "BELUM KAWIN", "KAWIN", "CERAI HIDUP", "CERAI MATI",
                 "MARRIED", "SINGLE", "DIVORCED"
             ],
-            "Kewarganegaraan": ["WNI", "WNA"]
+            "Kewarganegaraan": ["WNI", "WNA"],
+            "PROVINSI": [
+                "ACEH", "SUMATERA UTARA", "SUMATERA BARAT", "RIAU",
+                "KEPULAUAN RIAU", "JAMBI", "SUMATERA SELATAN",
+                "KEPULAUAN BANGKA BELITUNG", "BENGKULU", "LAMPUNG",
+                "DKI JAKARTA", "JAWA BARAT", "JAWA TENGAH", "DI YOGYAKARTA",
+                "JAWA TIMUR", "BANTEN", "BALI", "NUSA TENGGARA BARAT",
+                "NUSA TENGGARA TIMUR", "KALIMANTAN BARAT",
+                "KALIMANTAN TENGAH", "KALIMANTAN SELATAN",
+                "KALIMANTAN TIMUR", "KALIMANTAN UTARA", "SULAWESI UTARA",
+                "SULAWESI TENGAH", "SULAWESI SELATAN", "SULAWESI TENGGARA",
+                "GORONTALO", "SULAWESI BARAT", "MALUKU", "MALUKU UTARA",
+                "PAPUA", "PAPUA BARAT", "PAPUA TENGAH", "PAPUA PEGUNUNGAN",
+                "PAPUA SELATAN", "PAPUA BARAT DAYA"
+            ]
         }
 
     def _get_y_center(self, item):
@@ -160,10 +180,17 @@ class KTPExtractor:
                 continue
 
             if key_name in ["PROVINSI", "KABUPATEN"]:
-                value = re.sub(
-                    re.escape(key_name), '', key_item['text'],
-                    flags=re.IGNORECASE
-                ).strip()
+                if key_name == "PROVINSI":
+                    value = re.sub(
+                        r'PROVINSI', '', key_item['text'], flags=re.IGNORECASE
+                    ).strip()
+                else:
+                    # KABUPATEN keeps its KOTA/KABUPATEN prefix intact -
+                    # that word is significant (Kota Bekasi vs Kabupaten
+                    # Bekasi are different regions) and is only stripped
+                    # later, once resolve_wilayah has used it to pick the
+                    # right one.
+                    value = key_item['text'].strip()
 
                 value = re.sub(r'^[:\-\.\s]+', '', value).strip()
 
@@ -228,6 +255,15 @@ class KTPExtractor:
                     c for c in same_line_candidates
                     if not re.match(r'^[:\-\.\s]+$', c[1]['text'])
                 ]
+
+                if key_name == "NIK":
+                    valid_candidates = [
+                        c for c in valid_candidates
+                        if re.match(
+                            r'^\d',
+                            c[1]['text'].replace(' ', '').replace(':', '')
+                        )
+                    ]
 
                 if valid_candidates:
                     best_candidate = valid_candidates[0][1]
@@ -320,6 +356,43 @@ class KTPExtractor:
 
     def recover_missing_fields(self, extracted, values, claimed_ids,
                                key_map, trace_info):
+
+        if "KABUPATEN" not in extracted:
+            provinsi_key = key_map.get("PROVINSI")
+            nik_key = key_map.get("NIK")
+
+            if provinsi_key:
+                y_min = provinsi_key['box'][3][1]
+                y_max = (
+                    self._get_y_center(nik_key) if nik_key else y_min + 70
+                )
+
+                candidates = [
+                    val_item for val_item in values
+                    if val_item['id'] not in claimed_ids
+                    and val_item['id'] != provinsi_key['id']
+                    and y_min < self._get_y_center(val_item) < y_max
+                ]
+
+                if candidates:
+                    candidates.sort(key=self._get_y_center)
+                    chosen = candidates[0]
+                    # KOTA/KABUPATEN is kept here (not stripped) so
+                    # resolve_wilayah can use it to disambiguate regions
+                    # that exist as both a city and a regency, e.g. Kota
+                    # Bekasi vs Kabupaten Bekasi.
+                    value = re.sub(
+                        r'^[:\-\.\s]+', '', chosen['text']
+                    ).strip()
+
+                    if value:
+                        extracted["KABUPATEN"] = value
+                        claimed_ids.add(chosen['id'])
+                        trace_info["KABUPATEN"] = {
+                            "value": value,
+                            "source_ids": [chosen['id']],
+                            "method": "positional_inference_kabupaten"
+                        }
 
         for field, keywords in self.known_values.items():
             if field in extracted:
@@ -443,15 +516,24 @@ class KTPExtractor:
             if clean_value.startswith(':'):
                 clean_value = clean_value[1:].strip()
 
+            clean_value = re.sub(r',\s*', ', ', clean_value).strip()
+
             if key == "Agama":
                 match, score = process.extractOne(clean_value.upper(), self.known_values['Agama'])
                 if score > 70:
+                    clean_value = match
+
+            if key == "PROVINSI":
+                match, score = process.extractOne(clean_value.upper(), self.known_values['PROVINSI'])
+                if score > 85:
                     clean_value = match
             
             if key == "RT/RW":
                 nums = re.findall(r'\d+', clean_value)
                 if len(nums) >= 2:
                     clean_value = f"{nums[0]}/{nums[1]}"
+                elif len(nums) == 1:
+                    clean_value = f"{nums[0]}/-"
 
             if key == "Jenis Kelamin":
                 val_upper = clean_value.upper()
@@ -467,6 +549,11 @@ class KTPExtractor:
 
             if key == "Status Perkawinan":
                 val_upper = clean_value.upper()
+                fuzzy_match, fuzzy_score = process.extractOne(
+                    val_upper, self.known_values['Status Perkawinan']
+                )
+                if fuzzy_score > 75:
+                    val_upper = fuzzy_match
                 if any(k in val_upper for k in ["BELUM", "SINGLE"]):
                     clean_value = "BELUM KAWIN"
                 elif any(k in val_upper for k in ["KAWIN", "MARRIED"]):
@@ -490,7 +577,76 @@ class KTPExtractor:
             if key == "Pekerjaan":
                 clean_value = clean_value.replace("BURUHHARIAN", "BURUH HARIAN")
 
-            cleaned_data[key] = clean_value
+            cleaned_data[key] = clean_value.upper()
+
+        self.resolve_wilayah(cleaned_data)
+
+        return cleaned_data
+
+    def resolve_wilayah(self, cleaned_data):
+        """Correct PROVINSI/KABUPATEN/Kecamatan/Kel-Desa against the wilayah
+        db, each level scoped to the parent resolved just before it so OCR
+        typos are matched against a small, relevant candidate set."""
+
+        id_prov = None
+        id_kab = None
+        id_kec = None
+
+        if cleaned_data.get("PROVINSI"):
+            match = self.wilayah.match_provinsi(cleaned_data["PROVINSI"])
+            if match:
+                cleaned_data["PROVINSI"] = match['name']
+                id_prov = match['row']['id']
+
+        if cleaned_data.get("KABUPATEN"):
+            raw_kab = cleaned_data["KABUPATEN"]
+
+            # A bare name like "BEKASI" is ambiguous between Kota Bekasi and
+            # Kabupaten Bekasi - several regions exist as both. The
+            # KOTA/KABUPATEN prefix (kept intact until now) tells us which
+            # one, so use it to filter the db instead of guessing.
+            prefix_match = re.match(
+                r'^(KABUPATEN|KOTA)\b\s*', raw_kab, flags=re.IGNORECASE
+            )
+            tipe = None
+            kab_query = raw_kab
+            if prefix_match:
+                tipe = 1 if prefix_match.group(1).upper() == 'KABUPATEN' else 2
+                kab_query = raw_kab[prefix_match.end():].strip()
+
+            match = self.wilayah.match_kabupaten(
+                kab_query, id_prov=id_prov, tipe=tipe
+            )
+            if match:
+                cleaned_data["KABUPATEN"] = re.sub(
+                    r'^(KABUPATEN|KOTA)\s+(ADMINISTRASI\s+)?', '',
+                    match['name'], flags=re.IGNORECASE
+                ).strip()
+                id_kab = match['row']['id']
+                if id_prov is None:
+                    id_prov = match['row']['id_prov']
+            else:
+                cleaned_data["KABUPATEN"] = kab_query
+
+        if cleaned_data.get("Kecamatan"):
+            match = self.wilayah.match_kecamatan(
+                cleaned_data["Kecamatan"], id_kab=id_kab, id_prov=id_prov
+            )
+            if match:
+                cleaned_data["Kecamatan"] = match['name']
+                id_kec = match['row']['id']
+                if id_kab is None:
+                    id_kab = match['row']['id_kab']
+                if id_prov is None:
+                    id_prov = match['row']['id_prov']
+
+        if cleaned_data.get("Kel/Desa"):
+            match = self.wilayah.match_kelurahan(
+                cleaned_data["Kel/Desa"],
+                id_kec=id_kec, id_kab=id_kab, id_prov=id_prov
+            )
+            if match:
+                cleaned_data["Kel/Desa"] = match['name']
 
         return cleaned_data
 
