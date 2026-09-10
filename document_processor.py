@@ -4,10 +4,26 @@ import time
 import os
 import sys
 import traceback
+import logging
 from paddleocr import PaddleOCR
 from ktp_extractor import KTPExtractor, format_to_target_json
 from sim_extractor import SIMExtractor, format_sim_to_json
 from image_preprocessor import StandardPreprocessor, SmartSIMPreprocessor
+
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocr_logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+processing_logger = logging.getLogger("document_processor")
+processing_logger.setLevel(logging.INFO)
+if not processing_logger.handlers:
+    _handler = logging.FileHandler(
+        os.path.join(LOG_DIR, "processing.log"), encoding="utf-8"
+    )
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    processing_logger.addHandler(_handler)
+    processing_logger.propagate = False
 
 
 def identify_document_type(ocr_texts):
@@ -95,9 +111,16 @@ class DocumentProcessor:
         return merged
 
     def process_image(self, image_path):
+        start_time = time.time()
+        filename = os.path.basename(image_path)
+        doc_type = "UNKNOWN"
+        status = 500
+        log_extra = {}
+
         try:
             image = cv2.imread(image_path)
             if image is None:
+                status = 404
                 return {
                     "status": 404,
                     "error": True,
@@ -114,7 +137,6 @@ class DocumentProcessor:
 
             ocr_result_std = self.ocr.predict(std_image)
 
-            doc_type = "UNKNOWN"
             if ocr_result_std and ocr_result_std[0]:
                 doc_type = identify_document_type(
                     ocr_result_std[0].get("rec_texts", [])
@@ -137,7 +159,11 @@ class DocumentProcessor:
                     ocr_result_std,
                     return_trace=False
                 )
-                return format_to_target_json(data)
+                result = format_to_target_json(data)
+                status = result.get("status", 500)
+                log_extra["nik"] = data.get("NIK") if data else None
+                log_extra["nama"] = data.get("Nama") if data else None
+                return result
 
             if doc_type == "SIM":
                 texts = (
@@ -175,14 +201,23 @@ class DocumentProcessor:
 
                         if score_smart >= score_std:
                             final_data = self.merge_sim_data(data_smart, data_std)
-                            return format_sim_to_json(final_data)
+                            result = format_sim_to_json(final_data)
+                            status = result.get("status", 500)
+                            log_extra["nama"] = (
+                                final_data.get("Nama") if final_data else None
+                            )
+                            return result
                     except Exception as e:
                         print(f"[ERROR] Smart SIM Path Failed: {e}")
                         traceback.print_exc()
                         sys.stdout.flush()
 
-                return format_sim_to_json(data_std)
+                result = format_sim_to_json(data_std)
+                status = result.get("status", 500)
+                log_extra["nama"] = data_std.get("Nama") if data_std else None
+                return result
 
+            status = 400
             return {
                 "status": 400,
                 "error": True,
@@ -191,8 +226,23 @@ class DocumentProcessor:
 
         except Exception as e:
             traceback.print_exc()
+            status = 500
+            log_extra["error_message"] = str(e)
             return {
                 "status": 500,
                 "error": True,
                 "message": f"Internal Error: {str(e)}"
             }
+
+        finally:
+            duration = time.time() - start_time
+            log_parts = [
+                f"file={filename}",
+                f"doc_type={doc_type}",
+                f"status={status}",
+                f"duration={duration:.2f}s",
+            ]
+            for key, value in log_extra.items():
+                if value:
+                    log_parts.append(f"{key}={value}")
+            processing_logger.info(" | ".join(log_parts))
