@@ -68,6 +68,20 @@ class KTPExtractor:
         box = item['box']
         return (box[0][1] + box[3][1]) / 2
 
+    def _looks_like_key(self, text_upper, matched_field):
+        """A short OCR line can fuzzy-match a canonical field name via
+        partial_ratio purely by coincidence (e.g. value text "AMAT FAOZI"
+        partial-matches "Nama" through the shared "AMA" substring), which
+        would wrongly reclassify a value line as a key. Guard against that:
+        accept short/near-length matches outright, and for longer text only
+        accept it as a genuine "Key: Value" combined box when the text
+        actually starts with (a fuzzy version of) the field name."""
+        field_upper = matched_field.upper()
+        if len(text_upper) <= len(field_upper) + 4:
+            return True
+        prefix = text_upper[:len(field_upper) + 3]
+        return fuzz.ratio(prefix, field_upper) > 70
+
     def _find_second_line(self, recognized_data, key_item, first_line_item,
                            lower_bound_y, claimed_value_ids, key_ids,
                            extra_exclude=None):
@@ -194,7 +208,7 @@ class KTPExtractor:
                 item['canonical_field'] = truncated_match
                 potential_keys.append(item)
                 is_key = True
-            elif score > 80:
+            elif score > 80 and self._looks_like_key(text_upper, best_match):
                 item['canonical_field'] = best_match
                 potential_keys.append(item)
                 is_key = True
@@ -345,6 +359,23 @@ class KTPExtractor:
                         second_line = self._find_second_line(
                             recognized_data, key_item, best_candidate,
                             ttl_y, claimed_value_ids, key_ids
+                        )
+                        if second_line:
+                            value_text += f" {second_line['text']}"
+                            claimed_value_ids.add(second_line['id'])
+                            used_ids.append(second_line['id'])
+                            method = "geometric_match_multiline"
+
+                    elif key_name == 'Tempat/Tgl Lahir':
+                        jk_key = key_map.get('Jenis Kelamin')
+                        jk_y = (
+                            self._get_y_center(jk_key)
+                            if jk_key else float('inf')
+                        )
+
+                        second_line = self._find_second_line(
+                            recognized_data, key_item, best_candidate,
+                            jk_y, claimed_value_ids, key_ids
                         )
                         if second_line:
                             value_text += f" {second_line['text']}"
@@ -616,6 +647,9 @@ class KTPExtractor:
 
             if key == "Pekerjaan":
                 clean_value = clean_value.replace("BURUHHARIAN", "BURUH HARIAN")
+                match = self.wilayah.match_pekerjaan(clean_value.upper())
+                if match:
+                    clean_value = match['name']
 
             cleaned_data[key] = clean_value.upper()
 

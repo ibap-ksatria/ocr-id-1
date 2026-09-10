@@ -117,6 +117,14 @@ class WilayahLookup:
             ),
         ])
 
+    def match_pekerjaan(self, text, threshold=70):
+        return self._match_scoped(text, [
+            (
+                "SELECT id, kode, kategori, nama_pekerjaan AS name "
+                "FROM m_pekerjaan", (), threshold
+            ),
+        ])
+
     def match_kelurahan(self, text, id_kec=None, id_kab=None, id_prov=None):
         select = (
             "SELECT id, id_kec, id_kab, id_prov, "
