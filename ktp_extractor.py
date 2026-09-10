@@ -68,6 +68,42 @@ class KTPExtractor:
         box = item['box']
         return (box[0][1] + box[3][1]) / 2
 
+    def _find_second_line(self, recognized_data, key_item, first_line_item,
+                           lower_bound_y, claimed_value_ids, key_ids,
+                           extra_exclude=None):
+        """Find a wrapped second line of text sitting just below
+        first_line_item, bounded below by the y-position of the next
+        field's key (lower_bound_y) so it doesn't swallow unrelated rows."""
+        line1_y = self._get_y_center(first_line_item)
+
+        candidates = []
+        for val_item in recognized_data:
+            if val_item['id'] in claimed_value_ids:
+                continue
+            if val_item['id'] in (first_line_item['id'], key_item['id']):
+                continue
+            if val_item['id'] in key_ids:
+                continue
+
+            val_y = self._get_y_center(val_item)
+            is_below = val_y > (line1_y + 10)
+            is_above_bound = val_y < (lower_bound_y - 10)
+            is_close = (val_y - line1_y) < 45
+
+            if not (is_below and is_above_bound and is_close):
+                continue
+
+            if extra_exclude and extra_exclude(val_item):
+                continue
+
+            candidates.append(val_item)
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda c: c['box'][0][1])
+        return candidates[0]
+
     def process_ktp(self, ocr_result, return_trace=False):
         if not ocr_result or not ocr_result[0]:
             return (None, None, None) if return_trace else None
@@ -277,36 +313,40 @@ class KTPExtractor:
                             self._get_y_center(rt_rw_key)
                             if rt_rw_key else float('inf')
                         )
-                        addr_line1_y = self._get_y_center(best_candidate)
-                        
-                        second_line_cands = []
-                        for val_item in recognized_data: 
-                            if val_item['id'] in claimed_value_ids: continue
-                            if val_item['id'] == best_candidate['id']: continue
-                            if val_item['id'] == key_item['id']: continue
 
-                            val_y = self._get_y_center(val_item)
-                            
-                            is_below_addr = val_y > (addr_line1_y + 10)
-                            is_above_rtrw = val_y < (rt_rw_y - 10)
-                            is_close = (val_y - addr_line1_y) < 45
+                        def alamat_exclude(val_item):
+                            txt_upper = val_item['text'].upper()
+                            if re.search(r'\d{3}[/\s-]+\d{3}', val_item['text']):
+                                return True
+                            if "RT" in txt_upper and "RW" in txt_upper:
+                                return True
+                            if "KEL/DESA" in txt_upper:
+                                return True
+                            return False
 
-                            if is_below_addr and is_above_rtrw and is_close:
-                                txt_upper = val_item['text'].upper()
-                                if val_item['id'] in key_ids:
-                                    continue
-                                if re.search(r'\d{3}[/\s-]+\d{3}', val_item['text']):
-                                    continue
-                                if "RT" in txt_upper and "RW" in txt_upper: 
-                                    continue
-                                if "KEL/DESA" in txt_upper:
-                                    continue
+                        second_line = self._find_second_line(
+                            recognized_data, key_item, best_candidate,
+                            rt_rw_y, claimed_value_ids, key_ids,
+                            extra_exclude=alamat_exclude
+                        )
+                        if second_line:
+                            value_text += f" {second_line['text']}"
+                            claimed_value_ids.add(second_line['id'])
+                            used_ids.append(second_line['id'])
+                            method = "geometric_match_multiline"
 
-                                second_line_cands.append(val_item)
+                    elif key_name == 'Nama':
+                        ttl_key = key_map.get('Tempat/Tgl Lahir')
+                        ttl_y = (
+                            self._get_y_center(ttl_key)
+                            if ttl_key else float('inf')
+                        )
 
-                        if second_line_cands:
-                            second_line_cands.sort(key=lambda c: c['box'][0][1])
-                            second_line = second_line_cands[0]
+                        second_line = self._find_second_line(
+                            recognized_data, key_item, best_candidate,
+                            ttl_y, claimed_value_ids, key_ids
+                        )
+                        if second_line:
                             value_text += f" {second_line['text']}"
                             claimed_value_ids.add(second_line['id'])
                             used_ids.append(second_line['id'])
